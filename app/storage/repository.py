@@ -666,7 +666,7 @@ class Repository:
             
             # Build query conditionally based on reuse_analyzed_messages flag
             if reuse_analyzed_messages:
-                # Include all analyzed messages, even if already used in digests
+                # Debug mode: load all analyzed rows broadly for testing
                 query = """
                 SELECT
                     pm.id AS processed_message_id,
@@ -684,8 +684,8 @@ class Repository:
                 JOIN raw_messages rm ON rm.id = pm.raw_message_id
                 LEFT JOIN channels ch ON ch.id = rm.channel_id
                 WHERE pm.classification IS NOT NULL
-                  AND pm.classification != 'other'
-                  AND pm.is_duplicate = 0
+                  AND pm.metadata_json IS NOT NULL
+                  AND pm.metadata_json != ''
                   AND (? IS NULL OR datetime(rm.message_date) >= datetime(?))
                 ORDER BY pm.importance_score DESC, pm.id ASC
                 LIMIT ?;
@@ -721,6 +721,11 @@ class Repository:
             
             cur.execute(query, params)
             rows = cur.fetchall()
+            
+            # Log query results for debugging
+            mode = "DEBUG/REUSE" if reuse_analyzed_messages else "NORMAL"
+            logger.info("Digest candidate query (%s): loaded %d rows", mode, len(rows))
+            
             return [dict(row) for row in rows]
         finally:
             conn.close()
