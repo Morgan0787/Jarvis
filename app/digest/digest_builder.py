@@ -102,12 +102,12 @@ class DigestBuilder:
 
             is_relevant = metadata.get("is_relevant", False)
             if isinstance(is_relevant, bool):
-                relevant_bool = is_relevant
+                is_relevant_bool = is_relevant
             elif isinstance(is_relevant, str):
-                relevant_bool = is_relevant.strip().lower() in {"true", "1", "yes"}
+                is_relevant_bool = is_relevant.strip().lower() in {"true", "1", "yes"}
             else:
-                relevant_bool = False
-            if not relevant_bool:
+                is_relevant_bool = False
+            if not is_relevant_bool:
                 rejections['not_relevant'] += 1
                 continue
 
@@ -202,122 +202,19 @@ class DigestBuilder:
                 rejections['metadata_missing'] += 1
                 continue
 
-            # Relaxed relevance: allow items without explicit relevance flag
+            # Relaxed relevance: allow items unless explicitly marked as not relevant
             is_relevant = metadata.get("is_relevant", False)
-            if isinstance(is_relevant, bool):
-                relevant_bool = is_relevant
-            elif isinstance(is_relevant, str):
-                relevant_bool = is_relevant.strip().lower() in {"true", "1", "yes"}
-            else:
-                relevant_bool = True  # Default to relevant in relaxed mode
+            is_not_relevant = False
             
-            # Only reject if explicitly marked as not relevant
-            if isinstance(is_relevant, str) and is_relevant.strip().lower() in {"false", "0", "no"}:
-                rejections['not_relevant'] += 1
-                continue
-
-            category = str(metadata.get("category", "other")).strip().lower()
-            if category not in relaxed_categories:
-                rejections['category_not_allowed'] += 1
-                continue
-
-            try:
-                importance = int(metadata.get("importance_score", 1))
-            except (TypeError, ValueError):
-                importance = 1
-
-            try:
-                priority = int(metadata.get("priority_score", 1))
-            except (TypeError, ValueError):
-                priority = 1
-            priority = max(1, min(10, priority))
-
-            # Relaxed priority: lower threshold by 2 points
-            relaxed_threshold = max(1, threshold_used - 2)
-            if priority < relaxed_threshold:
-                rejections['priority_below_threshold'] += 1
-                continue
-
-            summary = metadata.get("summary", "")
-            if not isinstance(summary, str):
-                summary = ""
-            summary = summary.strip()
-
-            if not summary:
-                rejections['summary_missing'] += 1
-                continue
-            # Relaxed summary length: minimum 10 chars OR 3 words
-            words = summary.split()
-            if len(summary) < 10 and len(words) < 3:
-                rejections['summary_too_short'] += 1
-                continue
-
-            channel_username = row.get("channel_username") or ""
-            if channel_username and not channel_username.startswith("@"):
-                channel_username = f"@{channel_username}"
-            if not channel_username:
-                channel_username = "@unknown"
-
-            raw_message_date = row.get("message_date")
-            message_date: Optional[datetime] = None
-            if isinstance(raw_message_date, datetime):
-                message_date = raw_message_date
-            elif isinstance(raw_message_date, str):
-                raw_dt = raw_message_date.strip()
-                if raw_dt:
-                    try:
-                        message_date = datetime.fromisoformat(raw_dt.replace("Z", "+00:00"))
-                    except ValueError:
-                        message_date = None
-
-            items.append(
-                DigestItem(
-                    processed_message_id=int(row["processed_message_id"]),
-                    category=category,
-                    priority_score=priority,
-                    importance_score=importance,
-                    summary=summary,
-                    channel_username=channel_username,
-                    post_link=row.get("post_link"),
-                    message_date=message_date,
-                )
-            )
-        
-        return items, rejections
-
-    def _filter_items_relaxed(self, rows: List[Dict[str, Any]], threshold_used: int) -> tuple[List[DigestItem], Dict[str, int]]:
-        """
-        Apply relaxed filtering to digest candidates.
-        """
-        rejections = {
-            'metadata_missing': 0,
-            'not_relevant': 0,
-            'category_not_allowed': 0,
-            'priority_below_threshold': 0,
-            'summary_missing': 0,
-            'summary_too_short': 0,
-        }
-        
-        items: List[DigestItem] = []
-        relaxed_categories = set(SECTION_MAPPING.keys()) | {"other", "general", "news"}
-        
-        for row in rows:
-            metadata = self._safe_parse_metadata(row.get("metadata_json"))
-            if not metadata:
-                rejections['metadata_missing'] += 1
-                continue
-
-            # Relaxed relevance: allow items without explicit relevance flag
-            is_relevant = metadata.get("is_relevant", False)
             if isinstance(is_relevant, bool):
-                relevant_bool = is_relevant
+                # In relaxed mode, allow False relevance (don't filter out)
+                is_not_relevant = False
             elif isinstance(is_relevant, str):
-                relevant_bool = is_relevant.strip().lower() in {"true", "1", "yes"}
-            else:
-                relevant_bool = True  # Default to relevant in relaxed mode
+                # Only reject if explicitly marked as not relevant
+                is_not_relevant = is_relevant.strip().lower() in {"false", "0", "no"}
+            # Default: allow (no explicit rejection)
             
-            # Only reject if explicitly marked as not relevant
-            if isinstance(is_relevant, str) and is_relevant.strip().lower() in {"false", "0", "no"}:
+            if is_not_relevant:
                 rejections['not_relevant'] += 1
                 continue
 
