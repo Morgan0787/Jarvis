@@ -446,16 +446,18 @@ class Repository:
         Fetch processed messages that have not yet been analyzed by Ollama.
 
         We treat `classification IS NULL` as "not analyzed".
+        Returns newest messages first by joining with raw_messages.
         """
         conn = get_connection()
         try:
             cur = conn.cursor()
             cur.execute(
                 """
-                SELECT *
-                FROM processed_messages
-                WHERE classification IS NULL
-                ORDER BY id ASC
+                SELECT pm.*
+                FROM processed_messages pm
+                JOIN raw_messages rm ON rm.id = pm.raw_message_id
+                WHERE pm.classification IS NULL
+                ORDER BY rm.message_date DESC, pm.id DESC
                 LIMIT ?;
                 """,
                 (limit,),

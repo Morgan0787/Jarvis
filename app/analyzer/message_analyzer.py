@@ -287,7 +287,7 @@ class MessageAnalyzer:
             return AnalysisStats(analyzed_count=0, failed_count=0)
 
         logger.info(
-            "Analyzing %d processed messages with %s...", len(messages), self.provider
+            "Selected %d newest unanalyzed messages for analysis with %s...", len(messages), self.provider
         )
 
         analyzed = 0

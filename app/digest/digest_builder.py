@@ -79,11 +79,10 @@ class DigestBuilder:
             return None
         return data if isinstance(data, dict) else None
 
-    def build(self) -> DigestBuildResult:
+    def _filter_items_strict(self, rows: List[Dict[str, Any]], threshold_used: int) -> tuple[List[DigestItem], Dict[str, int]]:
         """
-        Build a digest from repository candidates.
+        Apply strict filtering to digest candidates.
         """
-        # Initialize rejection counters
         rejections = {
             'metadata_missing': 0,
             'not_relevant': 0,
@@ -91,66 +90,10 @@ class DigestBuilder:
             'priority_below_threshold': 0,
             'summary_missing': 0,
             'summary_too_short': 0,
-            'deduplication': 0,
-            'channel_diversity': 0,
         }
-        cfg = get_config()
-        recent_days = int(getattr(cfg, "digest_max_age_days", 3) or 3)
-        recent_days = max(1, recent_days)
-        reuse_mode = cfg.debug.reuse_analyzed_messages
-
-        if reuse_mode:
-            logger.info("Debug mode: reuse_analyzed_messages=ENABLED - will reuse already analyzed messages")
-        else:
-            logger.info("Normal mode: reuse_analyzed_messages=disabled - only new messages will be used")
-
-        def _fetch_candidates(max_age_days: int) -> tuple[List[Dict[str, Any]], int]:
-            # 7 -> if count >= 5 use them
-            rows = self.repo.get_digest_candidates_with_threshold(
-                min_priority=7, limit=self.candidate_limit, max_age_days=max_age_days, reuse_analyzed_messages=reuse_mode
-            )
-            if len(rows) >= 5:
-                return rows, 7
-
-            # Else fallback to 5
-            rows = self.repo.get_digest_candidates_with_threshold(
-                min_priority=5, limit=self.candidate_limit, max_age_days=max_age_days, reuse_analyzed_messages=reuse_mode
-            )
-            if len(rows) >= 3:
-                return rows, 5
-
-            # If still < 3, fallback to 3
-            rows = self.repo.get_digest_candidates_with_threshold(
-                min_priority=3, limit=self.candidate_limit, max_age_days=max_age_days, reuse_analyzed_messages=reuse_mode
-            )
-            return rows, 3
-
-        rows, threshold_used = _fetch_candidates(recent_days)
-        rows_loaded_initial = len(rows)
-
-        # If we don't have enough *recent* items, relax recency to 7 days.
-        if len(rows) < 3 and recent_days < 7:
-            rows, threshold_used = _fetch_candidates(7)
-            recency_used = 7
-
-        rows_loaded = len(rows)
-
-        logger.info("Digest threshold used: %d", threshold_used)
-        logger.info("Digest recency window used: %d days", recency_used)
-        logger.info("Rows loaded from database: %d", rows_loaded)
-
-        if not rows:
-            logger.info("No digest candidates found.")
-            return DigestBuildResult(
-                digest_text="",
-                included_processed_message_ids=[],
-                items_count=0,
-                title="",
-            )
-
+        
         items: List[DigestItem] = []
-        parsed_items: List[DigestItem] = []
-
+        
         for row in rows:
             metadata = self._safe_parse_metadata(row.get("metadata_json"))
             if not metadata:
@@ -199,6 +142,7 @@ class DigestBuilder:
             if not summary:
                 rejections['summary_missing'] += 1
                 continue
+            # Strict summary length: minimum 20 chars
             if len(summary) < 20:
                 rejections['summary_too_short'] += 1
                 continue
@@ -221,7 +165,7 @@ class DigestBuilder:
                     except ValueError:
                         message_date = None
 
-            parsed_items.append(
+            items.append(
                 DigestItem(
                     processed_message_id=int(row["processed_message_id"]),
                     category=category,
@@ -233,6 +177,219 @@ class DigestBuilder:
                     message_date=message_date,
                 )
             )
+        
+        return items, rejections
+
+    def _filter_items_relaxed(self, rows: List[Dict[str, Any]], threshold_used: int) -> tuple[List[DigestItem], Dict[str, int]]:
+        """
+        Apply relaxed filtering to digest candidates.
+        """
+        rejections = {
+            'metadata_missing': 0,
+            'not_relevant': 0,
+            'category_not_allowed': 0,
+            'priority_below_threshold': 0,
+            'summary_missing': 0,
+            'summary_too_short': 0,
+        }
+        
+        items: List[DigestItem] = []
+        relaxed_categories = set(SECTION_MAPPING.keys()) | {"other", "general", "news"}
+        
+        for row in rows:
+            metadata = self._safe_parse_metadata(row.get("metadata_json"))
+            if not metadata:
+                rejections['metadata_missing'] += 1
+                continue
+
+            # Relaxed relevance: allow items without explicit relevance flag
+            is_relevant = metadata.get("is_relevant", False)
+            if isinstance(is_relevant, bool):
+                relevant_bool = is_relevant
+            elif isinstance(is_relevant, str):
+                relevant_bool = is_relevant.strip().lower() in {"true", "1", "yes"}
+            else:
+                relevant_bool = True  # Default to relevant in relaxed mode
+            
+            # Only reject if explicitly marked as not relevant
+            if isinstance(is_relevant, str) and is_relevant.strip().lower() in {"false", "0", "no"}:
+                rejections['not_relevant'] += 1
+                continue
+
+            category = str(metadata.get("category", "other")).strip().lower()
+            if category not in relaxed_categories:
+                rejections['category_not_allowed'] += 1
+                continue
+
+            try:
+                importance = int(metadata.get("importance_score", 1))
+            except (TypeError, ValueError):
+                importance = 1
+
+            try:
+                priority = int(metadata.get("priority_score", 1))
+            except (TypeError, ValueError):
+                priority = 1
+            priority = max(1, min(10, priority))
+
+            # Relaxed priority: lower threshold by 2 points
+            relaxed_threshold = max(1, threshold_used - 2)
+            if priority < relaxed_threshold:
+                rejections['priority_below_threshold'] += 1
+                continue
+
+            summary = metadata.get("summary", "")
+            if not isinstance(summary, str):
+                summary = ""
+            summary = summary.strip()
+
+            if not summary:
+                rejections['summary_missing'] += 1
+                continue
+            # Relaxed summary length: minimum 10 chars OR 3 words
+            words = summary.split()
+            if len(summary) < 10 and len(words) < 3:
+                rejections['summary_too_short'] += 1
+                continue
+
+            channel_username = row.get("channel_username") or ""
+            if channel_username and not channel_username.startswith("@"):
+                channel_username = f"@{channel_username}"
+            if not channel_username:
+                channel_username = "@unknown"
+
+            raw_message_date = row.get("message_date")
+            message_date: Optional[datetime] = None
+            if isinstance(raw_message_date, datetime):
+                message_date = raw_message_date
+            elif isinstance(raw_message_date, str):
+                raw_dt = raw_message_date.strip()
+                if raw_dt:
+                    try:
+                        message_date = datetime.fromisoformat(raw_dt.replace("Z", "+00:00"))
+                    except ValueError:
+                        message_date = None
+
+            items.append(
+                DigestItem(
+                    processed_message_id=int(row["processed_message_id"]),
+                    category=category,
+                    priority_score=priority,
+                    importance_score=importance,
+                    summary=summary,
+                    channel_username=channel_username,
+                    post_link=row.get("post_link"),
+                    message_date=message_date,
+                )
+            )
+        
+        return items, rejections
+
+    def build(self) -> DigestBuildResult:
+        """
+        Build a digest from repository candidates.
+        """
+        # Initialize rejection counters
+        rejections = {
+            'metadata_missing': 0,
+            'not_relevant': 0,
+            'category_not_allowed': 0,
+            'priority_below_threshold': 0,
+            'summary_missing': 0,
+            'summary_too_short': 0,
+            'deduplication': 0,
+            'channel_diversity': 0,
+        }
+        cfg = get_config()
+        recent_days = int(getattr(cfg, "digest_max_age_days", 3) or 3)
+        recent_days = max(1, recent_days)
+        reuse_mode = cfg.debug.reuse_analyzed_messages
+
+        if reuse_mode:
+            logger.info("Debug mode: reuse_analyzed_messages=ENABLED - will reuse already analyzed messages")
+        else:
+            logger.info("Normal mode: reuse_analyzed_messages=disabled - only new messages will be used")
+
+        def _fetch_candidates(max_age_days: int) -> tuple[List[Dict[str, Any]], int]:
+            # 7 -> if count >= 5 use them
+            rows = self.repo.get_digest_candidates_with_threshold(
+                min_priority=7, limit=self.candidate_limit, max_age_days=max_age_days, reuse_analyzed_messages=reuse_mode
+            )
+            if len(rows) >= 5:
+                return rows, 7
+
+            # Else fallback to 5
+            rows = self.repo.get_digest_candidates_with_threshold(
+                min_priority=5, limit=self.candidate_limit, max_age_days=max_age_days, reuse_analyzed_messages=reuse_mode
+            )
+            if len(rows) >= 3:
+                return rows, 5
+
+            # If still < 3, fallback to 3
+            rows = self.repo.get_digest_candidates_with_threshold(
+                min_priority=3, limit=self.candidate_limit, max_age_days=max_age_days, reuse_analyzed_messages=reuse_mode
+            )
+            return rows, 3
+
+        rows, threshold_used = _fetch_candidates(recent_days)
+        rows_loaded_initial = len(rows)
+        recency_used = recent_days
+
+        # If we don't have enough *recent* items, relax recency to 7 days.
+        if len(rows) < 3 and recent_days < 7:
+            rows, threshold_used = _fetch_candidates(7)
+            recency_used = 7
+
+        rows_loaded = len(rows)
+
+        logger.info("Digest threshold used: %d", threshold_used)
+        logger.info("Digest recency window used: %d days", recency_used)
+        logger.info("Rows loaded from database: %d", rows_loaded)
+
+        if not rows:
+            logger.info("No digest candidates found.")
+            return DigestBuildResult(
+                digest_text="",
+                included_processed_message_ids=[],
+                items_count=0,
+                title="",
+            )
+
+        # Try strict filtering first
+        items: List[DigestItem] = []
+        parsed_items: List[DigestItem] = []
+        rejections = {
+            'metadata_missing': 0,
+            'not_relevant': 0,
+            'category_not_allowed': 0,
+            'priority_below_threshold': 0,
+            'summary_missing': 0,
+            'summary_too_short': 0,
+            'deduplication': 0,
+            'channel_diversity': 0,
+        }
+        
+        strict_items, strict_rejections = self._filter_items_strict(rows, threshold_used)
+        logger.info("Strict mode yielded %d items", len(strict_items))
+        
+        # If strict mode yields too few items, try relaxed mode
+        if len(strict_items) < 3:
+            logger.info("Too few items in strict mode, trying relaxed mode")
+            relaxed_items, relaxed_rejections = self._filter_items_relaxed(rows, threshold_used)
+            logger.info("Relaxed mode yielded %d items", len(relaxed_items))
+            # Use relaxed items if it gives us more usable content
+            if len(relaxed_items) > len(strict_items):
+                parsed_items = relaxed_items
+                rejections = relaxed_rejections
+                logger.info("Using relaxed mode results")
+            else:
+                parsed_items = strict_items
+                rejections = strict_rejections
+                logger.info("Using strict mode results (relaxed didn't improve)")
+        else:
+            parsed_items = strict_items
+            rejections = strict_rejections
+            logger.info("Using strict mode results")
 
         if not parsed_items:
             logger.info("No usable digest items after filtering/validation.")
