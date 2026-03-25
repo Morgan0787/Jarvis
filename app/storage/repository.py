@@ -512,7 +512,10 @@ class Repository:
                 """,
                 (classification, importance_score, metadata_json, processed_message_id),
             )
+            rows_affected = cur.rowcount
             conn.commit()
+            logger.info("Updated analysis for message_id=%s: rows_affected=%d, classification=%s, importance_score=%s", 
+                       processed_message_id, rows_affected, classification, importance_score)
         finally:
             conn.close()
 

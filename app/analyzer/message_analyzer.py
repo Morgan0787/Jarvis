@@ -297,30 +297,41 @@ class MessageAnalyzer:
             try:
                 prompt = self._build_prompt(msg.short_text or msg.cleaned_text)
                 raw_response = self.client.generate(prompt)
+                
+                logger.info("Raw AI response for message_id=%s: %r", msg.id, raw_response[:500] if raw_response else "EMPTY")
+                
                 parsed = self._extract_json_object(raw_response or "")
-
+                
                 if parsed is None:
                     logger.warning(
-                        "Invalid/empty JSON from Ollama for processed_message_id=%s: %r",
+                        "Invalid/empty JSON from AI for processed_message_id=%s: %r",
                         msg.id,
                         raw_response,
                     )
                     normalized = self._default_analysis()
                     metadata_json = json.dumps(normalized, ensure_ascii=False)
+                    
+                    logger.info("Using default analysis for message_id=%s: %s", msg.id, metadata_json[:200])
+                    
                     self.repo.update_processed_message_analysis(
                         processed_message_id=int(msg.id),
                         classification=str(normalized["category"]),
                         importance_score=float(normalized["importance_score"]),
                         metadata_json=metadata_json,
                     )
+                    logger.info("Saved default analysis to DB for message_id=%s", msg.id)
                     analyzed += 1
                     failed += 1
                     continue
 
+                logger.info("Parsed JSON for message_id=%s: %s", msg.id, str(parsed)[:200])
                 normalized = self._validate_and_normalize(parsed)
-
+                
                 # Store full validated JSON string in metadata_json.
                 metadata_json = json.dumps(normalized, ensure_ascii=False)
+                
+                logger.info("Final normalized metadata for message_id=%s: %s", msg.id, metadata_json[:200])
+                logger.info("Saving analysis to DB for message_id=%s", msg.id)
 
                 self.repo.update_processed_message_analysis(
                     processed_message_id=int(msg.id),
@@ -328,7 +339,8 @@ class MessageAnalyzer:
                     importance_score=float(normalized["importance_score"]),
                     metadata_json=metadata_json,
                 )
-
+                
+                logger.info("Successfully saved analysis to DB for message_id=%s", msg.id)
                 analyzed += 1
             except Exception as exc:  # noqa: BLE001
                 logger.exception(
